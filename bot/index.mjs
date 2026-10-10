@@ -328,6 +328,12 @@ async function deliverResult(target, result, userId, filenameBase, jobId) {
 
 async function executeMode(interactionOrMsg, { mode, source, name, engine, forceUnknown, reconstruct, userId, jobId }) {
   const isIx = typeof interactionOrMsg.editReply === "function";
+  const tag = `[6.5mz][job:${jobId || "adhoc"}][${mode}]`;
+
+  console.log(
+    `${tag} start — file="${name}" engine="${engine || "auto"}" forceUnknown=${!!forceUnknown} reconstruct=${!!reconstruct} srcLen=${(source || "").length}`,
+  );
+
   const logs = [];
   const tick = async () => {
     const tail = logs.slice(-8).join("\n").slice(0, 1400);
@@ -340,28 +346,60 @@ async function executeMode(interactionOrMsg, { mode, source, name, engine, force
     }
   };
   let lastTick = 0;
-  const result = await runJob({
-    mode,
-    source,
-    obfuscator: engine || "auto",
-    forceUnknown: !!forceUnknown,
-    reconstruct: !!reconstruct,
-    onLog: (l) => {
-      logs.push(l);
-      const now = Date.now();
-      if (now - lastTick > 2500) {
-        lastTick = now;
-        tick();
-      }
-    },
-  });
-  await deliverResult(
-    isIx ? { edit: (p) => interactionOrMsg.editReply(p), channel: interactionOrMsg.channel } : interactionOrMsg,
-    result,
-    userId,
-    name.replace(/\.[^.]+$/, "") + "." + mode,
-    jobId,
-  );
+  let result;
+  const startedAt = Date.now();
+  try {
+    result = await runJob({
+      mode,
+      source,
+      obfuscator: engine || "auto",
+      forceUnknown: !!forceUnknown,
+      reconstruct: !!reconstruct,
+      onLog: (l) => {
+        const line = typeof l === "string" ? l : JSON.stringify(l);
+        console.log(`${tag} ${line}`);
+        logs.push(line);
+        const now = Date.now();
+        if (now - lastTick > 2500) {
+          lastTick = now;
+          tick();
+        }
+      },
+    });
+  } catch (e) {
+    const msg = e && e.stack ? e.stack : String(e);
+    console.error(`${tag} runJob threw:`, msg);
+    result = {
+      ok: false,
+      error: `runJob threw: ${e?.message || e}`,
+      reconstructAvailable: true,
+    };
+  }
+
+  const elapsed = Date.now() - startedAt;
+  const outLen = result && typeof result.text === "string" ? result.text.length : 0;
+  if (result && result.ok) {
+    const sameAsInput = typeof result.text === "string" && result.text === source;
+    console.log(
+      `${tag} finish — ok=true engine="${result.engine || engine || "auto"}" partial=${!!result.partial} outLen=${outLen} srcLen=${(source || "").length} identical=${sameAsInput} elapsed=${elapsed}ms`,
+    );
+  } else {
+    console.error(
+      `${tag} finish — ok=false engine="${result?.engine || engine || "auto"}" error="${(result?.error || "unknown").toString().slice(0, 400)}" outLen=${outLen} elapsed=${elapsed}ms`,
+    );
+  }
+
+  try {
+    await deliverResult(
+      isIx ? { edit: (p) => interactionOrMsg.editReply(p), channel: interactionOrMsg.channel } : interactionOrMsg,
+      result,
+      userId,
+      name.replace(/\.[^.]+$/, "") + "." + mode,
+      jobId,
+    );
+  } catch (e) {
+    console.error(`${tag} deliverResult threw:`, e && e.stack ? e.stack : e);
+  }
   return result;
 }
 
@@ -489,21 +527,34 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
-    const detectionJob = await runJob({
-      mode: "detect",
-      source: grabbed.source,
-      onLog: () => {},
-    });
+    console.log(`[6.5mz][detect] start — file="${grabbed.name}" srcLen=${grabbed.source.length}`);
+    let detectionJob;
+    try {
+      detectionJob = await runJob({
+        mode: "detect",
+        source: grabbed.source,
+        onLog: (l) => console.log(`[6.5mz][detect] ${typeof l === "string" ? l : JSON.stringify(l)}`),
+      });
+    } catch (e) {
+      console.error("[6.5mz][detect] runJob threw:", e && e.stack ? e.stack : e);
+      await status.edit({ content: `**Failed**\nDetection error: ${e?.message || e}` });
+      return;
+    }
     if (detectionJob.damaged) {
+      console.error(`[6.5mz][detect] damaged — ${detectionJob.error}`);
       await status.edit({ content: `**Damaged input**\n${detectionJob.error}` });
       return;
     }
     if (detectionJob.error && !detectionJob.ok && !detectionJob.needsUnknownConfirm) {
+      console.error(`[6.5mz][detect] failed — ${detectionJob.error}`);
       await status.edit({ content: `**Failed**\n${detectionJob.error}` });
       return;
     }
     const peeled = detectionJob.source || grabbed.source;
     const det = detectionJob.detection || detect(peeled);
+    console.log(
+      `[6.5mz][detect] result — best="${det?.best?.id || "unknown"}" label="${det?.best?.label || "?"}" unknown=${!!det?.unknown} scores=${(det?.scores || []).length} peeledLen=${peeled.length}`,
+    );
     const jobId = `${message.id}`;
     savePending(jobId, {
       source: peeled,
@@ -519,6 +570,7 @@ client.on(Events.MessageCreate, async (message) => {
 
     await status.edit(pickerPayload(jobId, det, grabbed.name, peeled.length || grabbed.bytes));
   } catch (e) {
+    console.error("[6.5mz] message handler error:", e && e.stack ? e.stack : e);
     await message.reply("Error: " + (e.message || e)).catch(() => {});
   }
 });
@@ -547,9 +599,24 @@ client.on(Events.InteractionCreate, async (ix) => {
           return;
         }
         if (engine === "choose") {
-          const detectionJob = await runJob({ mode: "detect", source, onLog: () => {} });
+          console.log(`[6.5mz][slash-detect] start — file="${name}" srcLen=${source.length}`);
+          let detectionJob;
+          try {
+            detectionJob = await runJob({
+              mode: "detect",
+              source,
+              onLog: (l) => console.log(`[6.5mz][slash-detect] ${typeof l === "string" ? l : JSON.stringify(l)}`),
+            });
+          } catch (e) {
+            console.error("[6.5mz][slash-detect] runJob threw:", e && e.stack ? e.stack : e);
+            await ix.editReply(`**Failed**\nDetection error: ${e?.message || e}`);
+            return;
+          }
           const peeled = detectionJob.source || source;
           const det = detectionJob.detection || detect(peeled);
+          console.log(
+            `[6.5mz][slash-detect] result — best="${det?.best?.id || "unknown"}" label="${det?.best?.label || "?"}" unknown=${!!det?.unknown} scores=${(det?.scores || []).length} peeledLen=${peeled.length}`,
+          );
           const jobId = `s${ix.id}`;
           savePending(jobId, {
             source: peeled,
@@ -613,6 +680,7 @@ client.on(Events.InteractionCreate, async (ix) => {
       jobId,
     });
   } catch (e) {
+    console.error("[6.5mz] interaction handler error:", e && e.stack ? e.stack : e);
     try {
       if (ix.deferred || ix.replied) await ix.followUp({ content: "Error: " + (e.message || e), flags: MessageFlags.Ephemeral });
       else await ix.reply({ content: "Error: " + (e.message || e), flags: MessageFlags.Ephemeral });
